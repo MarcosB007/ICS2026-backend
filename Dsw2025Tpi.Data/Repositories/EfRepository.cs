@@ -36,7 +36,7 @@ public class EfRepository : IRepository
         return await Include(_context.Set<T>(), include).FirstOrDefaultAsync(predicate);
     }
 
-    public async Task<IEnumerable<T>?> GetAll<T>(params string[] include) where T : EntityBase
+    public async Task<IEnumerable<T>> GetAll<T>( params string[] include) where T : EntityBase
     {
         return await Include(_context.Set<T>(), include).ToListAsync();
     }
@@ -46,7 +46,7 @@ public class EfRepository : IRepository
         return await Include(_context.Set<T>(), include).FirstOrDefaultAsync(e => e.Id == id);
     }
 
-    public async Task<IEnumerable<T>?> GetFiltered<T>(Expression<Func<T, bool>> predicate, params string[] include) where T : EntityBase
+    public async Task<IEnumerable<T>> GetFiltered<T>( Expression<Func<T, bool>> predicate, params string[] include) where T : EntityBase
     {
         return await Include(_context.Set<T>(), include).Where(predicate).ToListAsync();
     }
