@@ -27,19 +27,19 @@ public class SpanishIdentityErrorDescriber : IdentityErrorDescriber
         return new IdentityError { Code = nameof(LoginAlreadyAssociated), Description = "Un usuario con ese login ya existe." };
     }
 
-    public override IdentityError InvalidUserName(string userName)
+    public override IdentityError InvalidUserName(string? userName)
     {
-        return new IdentityError { Code = nameof(InvalidUserName), Description = $"El usuario '{userName}' no es válido, solo puede contener letras o dígitos." };
+        return new IdentityError { Code = nameof(InvalidUserName), Description = $"El usuario '{userName ?? string.Empty}' no es válido, solo puede contener letras o dígitos." };
     }
 
-    public override IdentityError InvalidEmail(string email)
+    public override IdentityError InvalidEmail(string? email)
     {
-        return new IdentityError { Code = nameof(InvalidEmail), Description = $"El email '{email}' no es válido." };
+        return new IdentityError { Code = nameof(InvalidEmail), Description = $"El email '{email ?? string.Empty}' no es válido." };
     }
 
-    public override IdentityError DuplicateUserName(string userName)
+    public override IdentityError DuplicateUserName(string? userName)
     {
-        return new IdentityError { Code = nameof(DuplicateUserName), Description = $"El usuario '{userName}' ya está en uso." };
+        return new IdentityError { Code = nameof(DuplicateUserName), Description = $"El usuario '{userName ?? string.Empty}' ya está en uso." };
     }
 
     public override IdentityError DuplicateEmail(string email)
@@ -47,7 +47,7 @@ public class SpanishIdentityErrorDescriber : IdentityErrorDescriber
         return new IdentityError { Code = nameof(DuplicateEmail), Description = $"El email '{email}' ya está en uso." };
     }
 
-    public override IdentityError InvalidRoleName(string role)
+    public override IdentityError InvalidRoleName(string? role)
     {
         return new IdentityError { Code = nameof(InvalidRoleName), Description = $"El rol '{role}' no es válido." };
     }
