@@ -48,7 +48,7 @@ namespace Dsw2025Tpi.Api.Controllers
             var role = userRoles.FirstOrDefault() ?? "USER";
 
             Guid? customerId = null;
-            string customerName = user.UserName;
+            string customerName = user.UserName ?? user.Email ?? request.Username;
 
             // Comparamos ignorando mayúsculas para evitar errores tontos
             if (role.ToUpper() == "USER")
