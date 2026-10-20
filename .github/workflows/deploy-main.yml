@@ -6,6 +6,7 @@ on:
   pull_request:
     branches: [development, main]
   workflow_dispatch:
+
 env:
   DOCKERHUB_USERNAME: milagonz
   IMAGE_NAME: dsw2025tpi-api
@@ -22,6 +23,7 @@ jobs:
         with:
           username: ${{ env.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
+
       - name: 3. Construir la imagen Docker (.NET 8)
         run: |
           docker build \
@@ -29,11 +31,13 @@ jobs:
           -t ${{ env.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:latest \
           -f Dockerfile \
           .
+
       - name: 4. Subir la imagen a Docker Hub
         if: github.event_name != 'pull_request'
         run: |
           docker push ${{ env.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
           docker push ${{ env.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:latest
+
       - name: 5. Desplegar el contenedor en Azure App Service
         if: github.event_name != 'pull_request'
         uses: azure/webapps-deploy@v3
