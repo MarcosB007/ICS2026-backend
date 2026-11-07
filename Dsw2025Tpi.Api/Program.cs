@@ -153,10 +153,19 @@ public class Program
             try
             {
                 var authContext = services.GetRequiredService<AuthenticateContext>();
-                authContext.Database.Migrate();
-
                 var context = services.GetRequiredService<Dsw2025TpiContext>();
-                context.Database.Migrate();
+
+                if (app.Environment.IsEnvironment("Testing"))
+                {
+                    // Pruebas de integración: SQLite en memoria, se crea el esquema desde el modelo
+                    authContext.Database.EnsureCreated();
+                    context.Database.EnsureCreated();
+                }
+                else
+                {
+                    authContext.Database.Migrate();
+                    context.Database.Migrate();
+                }
 
                 var userManager = services.GetRequiredService<UserManager<IdentityUser>>();
                 var roleManager = services.GetRequiredService<RoleManager<IdentityRole>>();
