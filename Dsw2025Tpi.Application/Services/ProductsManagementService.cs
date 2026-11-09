@@ -98,7 +98,7 @@ namespace Dsw2025Tpi.Application.Services
             {
                 isActiveFilter = parsedStatus;
             }
-
+            var search = filter.Search?.Trim().ToLower(); //Convierte el texto buscado a minúsculas y le quita espacios al principio y al final
             var filteredProducts = await _repository.GetFiltered<Product>(p =>
                 
                 (includeInactive || p.IsActive)
@@ -110,11 +110,11 @@ namespace Dsw2025Tpi.Application.Services
 
                 &&
 
-                
-                (string.IsNullOrEmpty(filter.Search)
-                    || (p.Name != null && p.Name.Contains(filter.Search))
-                    || (p.InternalCode != null && p.InternalCode.Contains(filter.Search))
-                    || (p.Sku != null && p.Sku.Contains(filter.Search))
+                //Se cambio esta porcion de codigo para corregir la busqueda
+                (string.IsNullOrEmpty(search)
+                    || (p.Name != null && p.Name.ToLower().Contains(search))
+                    || (p.InternalCode != null && p.InternalCode.ToLower().Contains(search))
+                    || (p.Sku != null && p.Sku.ToLower().Contains(search))
                 )
             );
 
