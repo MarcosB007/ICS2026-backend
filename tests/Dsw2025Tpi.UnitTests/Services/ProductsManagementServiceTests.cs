@@ -108,4 +108,85 @@ public class ProductsManagementServiceTests
             Times.Never);
         _repositoryMock.Verify(r => r.Add(It.IsAny<Product>()), Times.Never);
     }
+
+
+
+
+    //Para pruebas de listado de productos
+
+        // ---------- GetProducts ----------
+
+    // Hace que el mock aplique el filtro que le envía el servicio sobre una lista de prueba
+    private void SetupProducts(List<Product> products)
+    {
+        _repositoryMock
+            .Setup(r => r.GetFiltered<Product>(It.IsAny<Expression<Func<Product, bool>>>(), It.IsAny<string[]>()))
+            .ReturnsAsync((Expression<Func<Product, bool>> predicate, string[] include) =>
+                products.Where(predicate.Compile()));
+    }
+
+    [Fact]
+    public async Task GetProducts_WhenIncludeInactiveIsFalse_ReturnsOnlyActiveProducts()
+    {
+        // Arrange
+        var activo1 = new Product("SKU-A1", "Auriculares", 500m, 5, null, "INT-A1");
+        var activo2 = new Product("SKU-A2", "Parlante", 900m, 3, null, "INT-A2");
+        var inactivo = new Product("SKU-I1", "Webcam", 700m, 2, null, "INT-I1") { IsActive = false };
+        SetupProducts(new List<Product> { activo1, activo2, inactivo });
+
+        var filter = new ProductModel.FilterProduct(null, null, null, null);
+
+        // Act
+        var result = await _service.GetProducts(filter, includeInactive: false);
+
+        // Assert
+        result.Total.Should().Be(2);
+        result.ProductItems.Should().HaveCount(2);
+        result.ProductItems.Should().OnlyContain(p => p.IsActive);
+        result.ProductItems.Should().NotContain(p => p.Sku == "SKU-I1");
+    }
+
+    [Fact]
+    public async Task GetProducts_WithPaginationFilter_AppliesSkipAndTakeCorrectly()
+    {
+        // Arrange: 15 productos, de "Producto 01" a "Producto 15"
+        var products = Enumerable.Range(1, 15)
+            .Select(i => new Product($"SKU-{i:00}", $"Producto {i:00}", 100m, 10, null, $"INT-{i:00}"))
+            .ToList();
+        SetupProducts(products);
+
+        var filter = new ProductModel.FilterProduct(null, null, 2, 5);   // página 2, de a 5
+
+        // Act
+        var result = await _service.GetProducts(filter);
+
+        // Assert
+        result.Total.Should().Be(15);
+        result.ProductItems.Should().HaveCount(5);
+        result.ProductItems.Select(p => p.Name).Should().Equal(
+            "Producto 06", "Producto 07", "Producto 08", "Producto 09", "Producto 10");
+    }
+
+    [Fact]
+    public async Task GetProducts_WithSearchTerm_FiltersByNameSkuOrInternalCode()
+    {
+        // Arrange
+        SetupProducts(new List<Product>
+        {
+            new("SKU-100", "Mouse Gamer", 2500m, 10, null, "INT-100"),
+            new("SKU-200", "Teclado Mecanico", 4000m, 10, null, "INT-200"),
+            new("SKU-300", "Monitor", 90000m, 10, null, "INT-300"),
+        });
+
+        var filter = new ProductModel.FilterProduct(null, "mouse", null, null);   // en minúsculas
+
+        // Act
+        var result = await _service.GetProducts(filter);
+
+        // Assert
+        result.Total.Should().Be(1);
+        result.ProductItems.Should().ContainSingle()
+              .Which.Name.Should().Be("Mouse Gamer");
+    }
+
 }
