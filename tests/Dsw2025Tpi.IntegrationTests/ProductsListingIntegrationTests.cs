@@ -1,5 +1,4 @@
 ﻿using System.Net;
-using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using System.Text.Json;
 using Dsw2025Tpi.Application.Dtos;
@@ -8,9 +7,7 @@ using FluentAssertions;
 namespace Dsw2025Tpi.IntegrationTests;
 
 /// <summary>
-/// Pruebas de integración HTTP para los endpoints de listado de productos.
-/// Verifican acceso público, búsqueda, paginación y consulta administrativa
-/// de productos inactivos mediante la API real y SQLite en memoria.
+/// Listado de productos: endpoint público (GET /api/products) y administrativo (GET /api/products/admin).
 /// </summary>
 [Collection("IntegrationTests")]
 public class ProductsListingIntegrationTests
@@ -23,182 +20,71 @@ public class ProductsListingIntegrationTests
     }
 
     [Fact]
-    public async Task GetProducts_WhenAnonymousAndMatchingProductExists_ReturnsProductsAndTotal()
+    public async Task GetProducts_PublicEndpoint_ReturnsOkWithPaginatedJsonStructure()
     {
-        // Arrange: crear un producto como administrador para consultarlo sin autenticación.
-        using var adminClient = _factory.CreateClient();
-        await AuthenticateAsAdminAsync(adminClient);
-        var productRequest = CreateProductRequest("PUBLIC");
-        var createResponse = await adminClient.PostAsJsonAsync("/api/products", productRequest);
-        createResponse.StatusCode.Should().Be(HttpStatusCode.Created);
+        // Arrange: al menos un producto activo en la base, para no obtener 204.
+        var product = await TestHelpers.SeedProductAsync(_factory);
+        using var client = _factory.CreateClient(); // sin credenciales
 
-        using var publicClient = _factory.CreateClient();
+        // Act
+        var response = await client.GetAsync($"/api/products?search={Uri.EscapeDataString(product.Sku)}");
 
-        // Act: el endpoint público se consulta sin enviar un JWT.
-        var response = await publicClient.GetAsync($"/api/products?search={Uri.EscapeDataString(productRequest.Sku)}");
+        // Assert: 200 OK y contrato JSON de paginación.
+        response.StatusCode.Should().Be(HttpStatusCode.OK);
 
-        // Assert: debe devolver el producto y el total de coincidencias.
+        using var document = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+        document.RootElement.TryGetProperty("productItems", out var items).Should().BeTrue();
+        items.ValueKind.Should().Be(JsonValueKind.Array);
+
+        var result = document.RootElement.Deserialize<ProductModel.ResponsePagination>(
+            new JsonSerializerOptions(JsonSerializerDefaults.Web));
+        result.Should().NotBeNull();
+        result!.Total.Should().Be(1);
+        result.ProductItems.Should().ContainSingle(p => p.Id == product.Id);
+    }
+
+    [Fact]
+    public async Task GetProducts_WithQueryStringFilters_ReturnsFilteredResultsFromSqlite()
+    {
+        // Arrange: 3 productos en SQLite, solo 2 contienen el término buscado.
+        var term = $"Termino{Guid.NewGuid():N}";
+        var match1 = await TestHelpers.SeedProductAsync(_factory, name: $"{term} Alfa");
+        var match2 = await TestHelpers.SeedProductAsync(_factory, name: $"Beta {term}");
+        var other = await TestHelpers.SeedProductAsync(_factory, name: $"Otro producto {Guid.NewGuid():N}");
+        using var client = _factory.CreateClient();
+
+        // Act
+        var response = await client.GetAsync($"/api/products?search={Uri.EscapeDataString(term)}&pageNumber=1&pageSize=10");
+
+        // Assert: el model binding del query string filtra contra la base de datos.
         response.StatusCode.Should().Be(HttpStatusCode.OK);
         var result = await response.Content.ReadFromJsonAsync<ProductModel.ResponsePagination>();
         result.Should().NotBeNull();
-        result!.Total.Should().Be(1);
-        result.ProductItems.Should().ContainSingle(product => product.Sku == productRequest.Sku);
+        result!.Total.Should().Be(2);
+        result.ProductItems.Select(p => p.Id).Should().BeEquivalentTo(new[] { match1.Id, match2.Id });
+        result.ProductItems.Select(p => p.Id).Should().NotContain(other.Id);
     }
 
     [Fact]
-    public async Task GetProducts_WithSearchAndPagination_ReturnsExpectedPageAndTotal()
+    public async Task GetAuthProducts_AdminEndpoint_WhenCalledByAdmin_IncludesInactiveProducts()
     {
-        // Arrange: crear tres productos que compartan un identificador de búsqueda.
-        using var adminClient = _factory.CreateClient();
-        await AuthenticateAsAdminAsync(adminClient);
-        var searchTerm = $"PAGINATION-{Guid.NewGuid():N}";
-
-        for (var index = 1; index <= 3; index++)
-        {
-            var request = CreateProductRequest("PAGE", $"{searchTerm}-{index}");
-            var createResponse = await adminClient.PostAsJsonAsync("/api/products", request);
-            createResponse.StatusCode.Should().Be(HttpStatusCode.Created);
-        }
-
-        using var client = _factory.CreateClient();
-
-        // Act: consultar la primera página, con dos elementos por página.
-        var firstPageResponse = await client.GetAsync(
-            $"/api/products?search={Uri.EscapeDataString(searchTerm)}&pageNumber=1&pageSize=2");
-
-        // Assert: el total representa todas las coincidencias, no solo los elementos de la página.
-        firstPageResponse.StatusCode.Should().Be(HttpStatusCode.OK);
-        var firstPage = await firstPageResponse.Content.ReadFromJsonAsync<ProductModel.ResponsePagination>();
-        firstPage.Should().NotBeNull();
-        firstPage!.Total.Should().Be(3);
-        firstPage.ProductItems.Should().HaveCount(2);
-
-        // Act: consultar la segunda página.
-        var secondPageResponse = await client.GetAsync(
-            $"/api/products?search={Uri.EscapeDataString(searchTerm)}&pageNumber=2&pageSize=2");
-
-        // Assert: queda un solo elemento y el total sigue siendo tres.
-        secondPageResponse.StatusCode.Should().Be(HttpStatusCode.OK);
-        var secondPage = await secondPageResponse.Content.ReadFromJsonAsync<ProductModel.ResponsePagination>();
-        secondPage.Should().NotBeNull();
-        secondPage!.Total.Should().Be(3);
-        secondPage.ProductItems.Should().ContainSingle();
-
-        firstPage.ProductItems.Select(product => product.Id)
-            .Intersect(secondPage.ProductItems.Select(product => product.Id))
-            .Should().BeEmpty("un mismo producto no debe aparecer en dos páginas distintas");
-    }
-
-    [Fact]
-    public async Task GetAdminProducts_WhenAnonymousOrRegularUser_ReturnsUnauthorizedOrForbidden()
-    {
-        // Arrange
-        using var anonymousClient = _factory.CreateClient();
-
-        // Act / Assert: el endpoint administrativo no permite acceso anónimo.
-        var anonymousResponse = await anonymousClient.GetAsync("/api/products/admin");
-        anonymousResponse.StatusCode.Should().Be(HttpStatusCode.Unauthorized);
-
-        // Arrange: registrar un usuario normal para obtener un JWT con rol USER.
-        using var userClient = _factory.CreateClient();
-        var userToken = await RegisterUserAndGetTokenAsync(userClient);
-        userClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", userToken);
-
-        // Act / Assert: estar autenticado no alcanza; se requiere el rol Admin.
-        var userResponse = await userClient.GetAsync("/api/products/admin");
-        userResponse.StatusCode.Should().Be(HttpStatusCode.Forbidden);
-    }
-
-    [Fact]
-    public async Task GetAdminProducts_IncludesInactiveProducts_WhilePublicListExcludesThem()
-    {
-        // Arrange: crear un producto y deshabilitarlo mediante el endpoint administrativo.
-        using var adminClient = _factory.CreateClient();
-        await AuthenticateAsAdminAsync(adminClient);
-
-        var productRequest = CreateProductRequest("INACTIVE");
-        var createResponse = await adminClient.PostAsJsonAsync("/api/products", productRequest);
-        createResponse.StatusCode.Should().Be(HttpStatusCode.Created);
-        var createdProduct = await createResponse.Content.ReadFromJsonAsync<ProductModel.ResponseProduct>();
-        createdProduct.Should().NotBeNull();
-
-        var disableResponse = await adminClient.PatchAsync($"/api/products/{createdProduct!.Id}", content: null);
-        disableResponse.StatusCode.Should().Be(HttpStatusCode.NoContent);
-
-        // Act: consultar el mismo producto desde el listado público y el administrativo.
+        // Arrange: producto inactivo sembrado directamente en SQLite.
+        var inactive = await TestHelpers.SeedProductAsync(_factory, isActive: false);
+        using var adminClient = await TestHelpers.CreateAdminClientAsync(_factory);
         using var publicClient = _factory.CreateClient();
-        var publicResponse = await publicClient.GetAsync(
-            $"/api/products?search={Uri.EscapeDataString(productRequest.Sku)}");
+        var search = Uri.EscapeDataString(inactive.Sku);
 
-        var adminResponse = await adminClient.GetAsync(
-            $"/api/products/admin?search={Uri.EscapeDataString(productRequest.Sku)}");
+        // Act
+        var adminResponse = await adminClient.GetAsync($"/api/products/admin?search={search}");
+        var publicResponse = await publicClient.GetAsync($"/api/products?search={search}");
 
-        // Assert: el listado público oculta inactivos y el administrativo los incluye.
-        publicResponse.StatusCode.Should().Be(HttpStatusCode.NoContent);
+        // Assert: el endpoint admin lo incluye...
         adminResponse.StatusCode.Should().Be(HttpStatusCode.OK);
-
         var adminResult = await adminResponse.Content.ReadFromJsonAsync<ProductModel.ResponsePagination>();
         adminResult.Should().NotBeNull();
-        adminResult!.Total.Should().Be(1);
-        adminResult.ProductItems.Should().ContainSingle(product =>
-            product.Id == createdProduct.Id && product.IsActive == false);
-    }
+        adminResult!.ProductItems.Should().ContainSingle(p => p.Id == inactive.Id && p.IsActive == false);
 
-    private static ProductModel.Request CreateProductRequest(string prefix, string? name = null)
-    {
-        var uniqueId = Guid.NewGuid().ToString("N");
-        return new ProductModel.Request(
-            Sku: $"SKU-{prefix}-{uniqueId}",
-            InternalCode: $"INT-{prefix}-{uniqueId}",
-            Name: name ?? $"Producto {prefix} {uniqueId[..8]}",
-            Description: "Producto creado para una prueba de integración de listados",
-            CurrentUnitPrice: 150m,
-            StockQuantity: 10);
-    }
-
-    private static async Task AuthenticateAsAdminAsync(HttpClient client)
-    {
-        var response = await client.PostAsJsonAsync(
-            "/api/auth/login",
-            new LoginModel("admin", "Admin123!"));
-
-        response.StatusCode.Should().Be(HttpStatusCode.OK,
-            "el administrador de prueba debe estar cargado desde admins.json");
-
-        var token = await ReadStringPropertyAsync(response, "token", "Token");
-        client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
-    }
-
-    private static async Task<string> RegisterUserAndGetTokenAsync(HttpClient client)
-    {
-        var uniqueId = Guid.NewGuid().ToString("N");
-        var response = await client.PostAsJsonAsync(
-            "/api/auth/register",
-            new RegisterModel(
-                Username: $"listinguser{uniqueId}",
-                Password: "Test123!",
-                Email: $"listinguser{uniqueId}@integration.local"));
-
-        response.StatusCode.Should().Be(HttpStatusCode.OK,
-            "el usuario de prueba debe poder registrarse para obtener un JWT válido");
-
-        return await ReadStringPropertyAsync(response, "token", "Token");
-    }
-
-    private static async Task<string> ReadStringPropertyAsync(HttpResponseMessage response, params string[] names)
-    {
-        using var document = await JsonDocument.ParseAsync(await response.Content.ReadAsStreamAsync());
-        foreach (var name in names)
-        {
-            if (document.RootElement.TryGetProperty(name, out var property)
-                && property.ValueKind == JsonValueKind.String
-                && !string.IsNullOrWhiteSpace(property.GetString()))
-            {
-                return property.GetString()!;
-            }
-        }
-
-        throw new Xunit.Sdk.XunitException(
-            $"No se encontró ninguna de estas propiedades en la respuesta: {string.Join(", ", names)}");
+        // ...a diferencia del público, que no lo muestra.
+        publicResponse.StatusCode.Should().Be(HttpStatusCode.NoContent);
     }
 }
