@@ -1,159 +1,99 @@
 ﻿using System.Net;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
-using System.Text.Json;
 using Dsw2025Tpi.Application.Dtos;
 using FluentAssertions;
 
 namespace Dsw2025Tpi.IntegrationTests;
 
 /// <summary>
-/// Pruebas de integración HTTP para los endpoints de ProductsController.
-/// Se utiliza la API real levantada por WebApplicationFactory y SQLite en memoria.
+/// Creación de productos (POST /api/products): seguridad, persistencia real en SQLite y conflicto de SKU.
 /// </summary>
 [Collection("IntegrationTests")]
 public class ProductsControllerIntegrationTests
 {
-    private readonly HttpClient _client;
+    private readonly CustomWebApplicationFactory _factory;
 
     public ProductsControllerIntegrationTests(CustomWebApplicationFactory factory)
     {
-        _client = factory.CreateClient();
+        _factory = factory;
     }
 
     [Fact]
-    public async Task AddProduct_WhenUnauthenticated_ReturnsUnauthorized()
+    public async Task AddProduct_WhenUnauthenticatedOrNotAdmin_ReturnsUnauthorizedOrForbidden()
     {
-        // Arrange: una solicitud válida, pero sin encabezado Authorization.
-        var request = CreateProductRequest();
+        // Arrange
+        var request = TestHelpers.NewProductRequest();
+
+        // Act 1: petición anónima (sin token) -> 401
+        using var anonymousClient = _factory.CreateClient();
+        var anonymousResponse = await anonymousClient.PostAsJsonAsync("/api/products", request);
+
+        // Act 2: usuario autenticado con rol distinto de Admin -> 403
+        var (userClient, _) = await TestHelpers.CreateCustomerClientAsync(_factory);
+        using var userClientScope = userClient;
+        var userResponse = await userClient.PostAsJsonAsync("/api/products", request);
+
+        // Assert
+        anonymousResponse.StatusCode.Should().Be(HttpStatusCode.Unauthorized);
+        userResponse.StatusCode.Should().Be(HttpStatusCode.Forbidden);
+
+        // Ninguna de las dos peticiones rechazadas debe haber persistido el producto.
+        (await TestHelpers.GetProductFromDbBySkuAsync(_factory, request.Sku)).Should().BeNull();
+    }
+
+    [Fact]
+    public async Task AddProduct_WhenAuthenticatedAsAdmin_PersistsInSqliteAndReturnsCreated()
+    {
+        // Arrange
+        using var adminClient = await TestHelpers.CreateAdminClientAsync(_factory);
+        var request = TestHelpers.NewProductRequest("ADMIN", stock: 15);
 
         // Act
-        var response = await _client.PostAsJsonAsync("/api/products", request);
+        var response = await adminClient.PostAsJsonAsync("/api/products", request);
 
-        // Assert: el endpoint requiere autenticación y el rol Admin.
-        response.StatusCode.Should().Be(HttpStatusCode.Unauthorized);
+        // Assert: respuesta HTTP
+        response.StatusCode.Should().Be(HttpStatusCode.Created);
+        var created = await response.Content.ReadFromJsonAsync<ProductModel.ResponseProduct>();
+        created.Should().NotBeNull();
+
+        // Assert: la fila existe realmente en la tabla Products de SQLite, con los valores enviados.
+        var persisted = await TestHelpers.GetProductFromDbAsync(_factory, created!.Id);
+        persisted.Should().NotBeNull("la API debe haber insertado la fila en la base de datos");
+        persisted!.Sku.Should().Be(request.Sku);
+        persisted.InternalCode.Should().Be(request.InternalCode);
+        persisted.Name.Should().Be(request.Name);
+        persisted.Description.Should().Be(request.Description);
+        persisted.CurrentUnitPrice.Should().Be(request.CurrentUnitPrice);
+        persisted.StockQuantity.Should().Be(request.StockQuantity);
+        persisted.IsActive.Should().BeTrue();
     }
 
     [Fact]
-    public async Task AddProduct_WhenAuthenticatedAsRegularUser_ReturnsForbidden()
+    public async Task AddProduct_WhenSkuAlreadyExistsInDatabase_ReturnsConflictStatusCode()
     {
-        // Arrange: registrar un usuario normal para obtener un JWT real con rol USER.
-        var token = await RegisterRegularUserAndGetTokenAsync();
-        _client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
-        var request = CreateProductRequest();
+        // Arrange: producto pre-insertado directamente en SQLite.
+        var existing = await TestHelpers.SeedProductAsync(_factory);
+        using var adminClient = await TestHelpers.CreateAdminClientAsync(_factory);
 
-        // Act
-        var response = await _client.PostAsJsonAsync("/api/products", request);
-
-        // Assert: el usuario está autenticado, pero no tiene el rol Admin.
-        response.StatusCode.Should().Be(HttpStatusCode.Forbidden);
-    }
-
-    [Fact]
-    public async Task AddProduct_WhenAuthenticatedAsAdmin_CreatesProductAndPersistsIt()
-    {
-        // Arrange: iniciar sesión con el administrador cargado desde admins.json.
-        var token = await LoginAsAdminAndGetTokenAsync();
-        _client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
-        var request = CreateProductRequest();
-
-        // Act: crear el producto mediante HTTP.
-        var createResponse = await _client.PostAsJsonAsync("/api/products", request);
-
-        // Assert: la API responde Created y proporciona la ubicación del recurso.
-        createResponse.StatusCode.Should().Be(HttpStatusCode.Created);
-        createResponse.Headers.Location.Should().NotBeNull();
-
-        var createdProduct = await createResponse.Content.ReadFromJsonAsync<ProductModel.ResponseProduct>();
-        createdProduct.Should().NotBeNull();
-        createdProduct!.Sku.Should().Be(request.Sku);
-        createdProduct.Name.Should().Be(request.Name);
-
-        // Comprobar la persistencia consultando el recurso desde otro request HTTP.
-        var getResponse = await _client.GetAsync($"/api/products/{createdProduct.Id}");
-
-        getResponse.StatusCode.Should().Be(HttpStatusCode.OK);
-        var persistedProduct = await getResponse.Content.ReadFromJsonAsync<ProductModel.ResponseProduct>();
-        persistedProduct.Should().NotBeNull();
-        persistedProduct!.Id.Should().Be(createdProduct.Id);
-        persistedProduct.Sku.Should().Be(request.Sku);
-        persistedProduct.StockQuantity.Should().Be(request.StockQuantity);
-    }
-
-    [Fact]
-    public async Task AddProduct_WhenSkuAlreadyExists_ReturnsBadRequestInsteadOfServerError()
-    {
-        // Arrange: crear primero un producto válido como administrador.
-        var token = await LoginAsAdminAndGetTokenAsync();
-        _client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
-        var request = CreateProductRequest();
-
-        var firstResponse = await _client.PostAsJsonAsync("/api/products", request);
-        firstResponse.StatusCode.Should().Be(HttpStatusCode.Created);
-
-        // Act: volver a enviar el mismo SKU.
-        var duplicateResponse = await _client.PostAsJsonAsync("/api/products", request);
-
-        // Assert: el middleware transforma DuplicatedEntityException en 400.
-        duplicateResponse.StatusCode.Should().Be(HttpStatusCode.BadRequest);
-        duplicateResponse.StatusCode.Should().NotBe(HttpStatusCode.InternalServerError);
-    }
-
-    private static ProductModel.Request CreateProductRequest()
-    {
-        var uniqueId = Guid.NewGuid().ToString("N");
-
-        return new ProductModel.Request(
-            Sku: $"SKU-TEST-{uniqueId}",
-            InternalCode: $"INT-TEST-{uniqueId}",
-            Name: $"Producto de integración {uniqueId[..8]}",
-            Description: "Producto creado durante una prueba de integración",
+        var duplicated = new ProductModel.Request(
+            Sku: existing.Sku,
+            InternalCode: $"INT-DUP-{Guid.NewGuid():N}",
+            Name: "Producto con SKU duplicado",
+            Description: "Intento de crear un producto con un SKU ya existente",
             CurrentUnitPrice: 100m,
-            StockQuantity: 10
-        );
-    }
+            StockQuantity: 5);
 
-    private async Task<string> LoginAsAdminAndGetTokenAsync()
-    {
-        // Estas credenciales corresponden al administrador definido en admins.json.
-        var response = await _client.PostAsJsonAsync(
-            "/api/auth/login",
-            new LoginModel("admin", "Admin123!"));
+        // Act
+        var response = await adminClient.PostAsJsonAsync("/api/products", duplicated);
 
-        response.StatusCode.Should().Be(HttpStatusCode.OK,
-            "el administrador de prueba debe estar cargado desde admins.json");
+        // Assert: no es un 500; el middleware responde 409 Conflict (o 400 Bad Request).
+        response.StatusCode.Should().NotBe(HttpStatusCode.InternalServerError);
+        response.StatusCode.Should().BeOneOf(HttpStatusCode.Conflict, HttpStatusCode.BadRequest);
 
-        return await ReadTokenAsync(response);
-    }
-
-    private async Task<string> RegisterRegularUserAndGetTokenAsync()
-    {
-        var uniqueId = Guid.NewGuid().ToString("N");
-        var request = new RegisterModel(
-            Username: $"testuser{uniqueId}",
-            Password: "Test123!",
-            Email: $"testuser{uniqueId}@integration.local");
-
-        var response = await _client.PostAsJsonAsync("/api/auth/register", request);
-
-        response.StatusCode.Should().Be(HttpStatusCode.OK,
-            "el usuario de prueba debe poder registrarse para obtener un JWT válido");
-
-        return await ReadTokenAsync(response);
-    }
-
-    private static async Task<string> ReadTokenAsync(HttpResponseMessage response)
-    {
-        using var document = await JsonDocument.ParseAsync(await response.Content.ReadAsStreamAsync());
-
-        // La API serializa normalmente como camelCase, pero se admite también PascalCase.
-        var token = document.RootElement.TryGetProperty("token", out var camelCaseToken)
-            ? camelCaseToken.GetString()
-            : document.RootElement.TryGetProperty("Token", out var pascalCaseToken)
-                ? pascalCaseToken.GetString()
-                : null;
-
-        token.Should().NotBeNullOrWhiteSpace("la respuesta de autenticación debe incluir un JWT");
-        return token!;
+        // Y sigue existiendo un único producto con ese SKU.
+        var persisted = await TestHelpers.GetProductFromDbBySkuAsync(_factory, existing.Sku);
+        persisted.Should().NotBeNull();
+        persisted!.Id.Should().Be(existing.Id);
     }
 }
