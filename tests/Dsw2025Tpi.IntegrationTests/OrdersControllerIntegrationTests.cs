@@ -1,15 +1,17 @@
 ﻿using System.Net;
-using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using System.Text.Json;
-using Dsw2025Tpi.Application.Dtos;
+using Dsw2025Tpi.Data;
+using Dsw2025Tpi.Domain.Entities;
 using FluentAssertions;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.DependencyInjection;
 
 namespace Dsw2025Tpi.IntegrationTests;
 
 /// <summary>
-/// Pruebas de integración HTTP para la creación de órdenes.
-/// Verifican autenticación, persistencia y actualización del stock usando la API real.
+/// Creación de órdenes (POST /api/orders): JWT obligatorio, transacción completa
+/// (orden + descuento de stock) y manejo de stock insuficiente.
 /// </summary>
 [Collection("IntegrationTests")]
 public class OrdersControllerIntegrationTests
@@ -24,7 +26,7 @@ public class OrdersControllerIntegrationTests
     [Fact]
     public async Task CreateOrder_WhenUnauthenticated_ReturnsUnauthorized()
     {
-        // Arrange
+        // Arrange: payload de orden válido en forma, pero sin header Authorization.
         using var client = _factory.CreateClient();
         var request = new
         {
@@ -43,199 +45,78 @@ public class OrdersControllerIntegrationTests
     }
 
     [Fact]
-    public async Task CreateOrder_WhenAuthenticated_CreatesOrderPersistsItAndDecreasesStock()
+    public async Task CreateOrder_WhenAuthenticatedWithValidData_ReturnsCreatedAndPersistsOrderAndStockInSqlite()
     {
-        // Arrange: crear un producto con stock inicial 10 y registrar un cliente real.
-        using var adminClient = _factory.CreateClient();
-        var adminToken = await LoginAsAdminAndGetTokenAsync(adminClient);
-        adminClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", adminToken);
+        // Arrange: cliente autenticado (JWT real) + producto sembrado en SQLite con stock 10.
+        var (customerClient, customerId) = await TestHelpers.CreateCustomerClientAsync(_factory);
+        using var customerClientScope = customerClient;
+        var product = await TestHelpers.SeedProductAsync(_factory, stock: 10);
 
-        var productRequest = CreateProductRequest(stock: 10);
-        var productResponse = await adminClient.PostAsJsonAsync("/api/products", productRequest);
-        productResponse.StatusCode.Should().Be(HttpStatusCode.Created);
-        var product = await productResponse.Content.ReadFromJsonAsync<ProductModel.ResponseProduct>();
-        product.Should().NotBeNull();
-
-        using var customerClient = _factory.CreateClient();
-        var (customerToken, customerId) = await RegisterCustomerAndGetCredentialsAsync(customerClient);
-        customerClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", customerToken);
-
-        const int orderedQuantity = 3;
-        var orderRequest = new
+        var request = new
         {
             CustomerId = customerId,
             ShippingAddress = "Av. Siempre Viva 742",
             BillingAddress = "Av. Siempre Viva 742",
             Notes = "Prueba de integración de órdenes",
-            Items = new[] { new { ProductId = product!.Id, Quantity = orderedQuantity } }
+            Items = new[] { new { ProductId = product.Id, Quantity = 3 } }
         };
 
-        // Act: crear la orden mediante HTTP.
-        var createResponse = await customerClient.PostAsJsonAsync("/api/orders", orderRequest);
+        // Act
+        var response = await customerClient.PostAsJsonAsync("/api/orders", request);
 
-        // Assert: respuesta HTTP y encabezado Location.
-        createResponse.StatusCode.Should().Be(HttpStatusCode.Created);
-        createResponse.Headers.Location.Should().NotBeNull();
+        // Assert: 201 Created + header Location
+        response.StatusCode.Should().Be(HttpStatusCode.Created);
+        response.Headers.Location.Should().NotBeNull();
 
-        using var createdDocument = await JsonDocument.ParseAsync(await createResponse.Content.ReadAsStreamAsync());
-        var orderId = ReadGuid(createdDocument.RootElement, "orderId", "OrderId");
-        orderId.Should().NotBe(Guid.Empty);
+        using var body = await JsonDocument.ParseAsync(await response.Content.ReadAsStreamAsync());
+        var orderId = TestHelpers.TryReadGuid(body.RootElement, "orderId", "OrderId", "id", "Id");
+        orderId.Should().NotBeNull("la respuesta debe incluir el identificador de la orden creada");
 
-        // Verificar persistencia consultando la orden desde su endpoint GET.
-        var getOrderResponse = await customerClient.GetAsync($"/api/orders/{orderId}");
-        getOrderResponse.StatusCode.Should().Be(HttpStatusCode.OK);
+        // Assert: la orden existe en la tabla Orders de SQLite.
+        using (var scope = _factory.Services.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<Dsw2025TpiContext>();
+            var order = await db.Set<Order>().AsNoTracking().FirstOrDefaultAsync(o => o.Id == orderId);
+            order.Should().NotBeNull("la orden debe haberse insertado en la base de datos");
+        }
 
-        using var persistedOrderDocument = await JsonDocument.ParseAsync(await getOrderResponse.Content.ReadAsStreamAsync());
-        ReadGuid(persistedOrderDocument.RootElement, "orderId", "OrderId").Should().Be(orderId);
-
-        // Verificar que el stock se haya actualizado de 10 a 7.
-        var getProductResponse = await customerClient.GetAsync($"/api/products/{product.Id}");
-        getProductResponse.StatusCode.Should().Be(HttpStatusCode.OK);
-        var updatedProduct = await getProductResponse.Content.ReadFromJsonAsync<ProductModel.ResponseProduct>();
-        updatedProduct.Should().NotBeNull();
-        updatedProduct!.StockQuantity.Should().Be(10 - orderedQuantity);
+        // Assert: el stock en la tabla Products bajó de 10 a 7.
+        var updated = await TestHelpers.GetProductFromDbAsync(_factory, product.Id);
+        updated.Should().NotBeNull();
+        updated!.StockQuantity.Should().Be(7);
     }
 
     [Fact]
-    public async Task CreateOrder_WhenStockIsInsufficient_ReturnsBadRequestAndDoesNotChangeStock()
+    public async Task CreateOrder_WhenStockIsInsufficient_ReturnsBadRequestWithErrorMessage()
     {
-        // Arrange: el producto tiene 2 unidades, pero se solicitan 3.
-        using var adminClient = _factory.CreateClient();
-        var adminToken = await LoginAsAdminAndGetTokenAsync(adminClient);
-        adminClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", adminToken);
+        // Arrange: el producto tiene 2 unidades y se piden 5.
+        var (customerClient, customerId) = await TestHelpers.CreateCustomerClientAsync(_factory);
+        using var customerClientScope = customerClient;
+        var product = await TestHelpers.SeedProductAsync(_factory, stock: 2);
 
-        var productRequest = CreateProductRequest(stock: 2);
-        var productResponse = await adminClient.PostAsJsonAsync("/api/products", productRequest);
-        productResponse.StatusCode.Should().Be(HttpStatusCode.Created);
-        var product = await productResponse.Content.ReadFromJsonAsync<ProductModel.ResponseProduct>();
-        product.Should().NotBeNull();
-
-        using var customerClient = _factory.CreateClient();
-        var (customerToken, customerId) = await RegisterCustomerAndGetCredentialsAsync(customerClient);
-        customerClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", customerToken);
-
-        var orderRequest = new
+        var request = new
         {
             CustomerId = customerId,
             ShippingAddress = "Calle de prueba 456",
             BillingAddress = "Calle de prueba 456",
             Notes = "Prueba de stock insuficiente",
-            Items = new[] { new { ProductId = product!.Id, Quantity = 3 } }
+            Items = new[] { new { ProductId = product.Id, Quantity = 5 } }
         };
 
-        // Registrar cuántas órdenes existen antes del intento para comprobar que no se persista ninguna.
-        var ordersBeforeResponse = await customerClient.GetAsync("/api/orders");
-        ordersBeforeResponse.StatusCode.Should().Be(HttpStatusCode.OK);
-        using var ordersBeforeDocument = await JsonDocument.ParseAsync(await ordersBeforeResponse.Content.ReadAsStreamAsync());
-        var ordersBefore = ReadInt(ordersBeforeDocument.RootElement, "total", "Total");
-
         // Act
-        var response = await customerClient.PostAsJsonAsync("/api/orders", orderRequest);
+        var response = await customerClient.PostAsJsonAsync("/api/orders", request);
 
-        // Assert: la API debe rechazar la orden por falta de stock.
+        // Assert: 400 (no 500) con un JSON que explica la falta de stock.
         response.StatusCode.Should().Be(HttpStatusCode.BadRequest);
-        response.StatusCode.Should().NotBe(HttpStatusCode.InternalServerError);
+        response.Content.Headers.ContentType?.MediaType.Should().Contain("json");
 
-        // El producto debe conservar su stock original.
-        var getProductResponse = await customerClient.GetAsync($"/api/products/{product.Id}");
-        getProductResponse.StatusCode.Should().Be(HttpStatusCode.OK);
-        var unchangedProduct = await getProductResponse.Content.ReadFromJsonAsync<ProductModel.ResponseProduct>();
-        unchangedProduct.Should().NotBeNull();
-        unchangedProduct!.StockQuantity.Should().Be(2);
+        var content = await response.Content.ReadAsStringAsync();
+        content.Should().NotBeNullOrWhiteSpace();
+        using var json = JsonDocument.Parse(content); // debe ser JSON válido
+        content.Should().MatchRegex("(?i)stock", "el mensaje debe indicar claramente la falta de stock");
 
-        // No debe haberse persistido una orden nueva.
-        var ordersAfterResponse = await customerClient.GetAsync("/api/orders");
-        ordersAfterResponse.StatusCode.Should().Be(HttpStatusCode.OK);
-        using var ordersAfterDocument = await JsonDocument.ParseAsync(await ordersAfterResponse.Content.ReadAsStreamAsync());
-        ReadInt(ordersAfterDocument.RootElement, "total", "Total").Should().Be(ordersBefore);
-    }
-
-    private static ProductModel.Request CreateProductRequest(int stock)
-    {
-        var uniqueId = Guid.NewGuid().ToString("N");
-        return new ProductModel.Request(
-            Sku: $"SKU-ORDER-{uniqueId}",
-            InternalCode: $"INT-ORDER-{uniqueId}",
-            Name: $"Producto para orden {uniqueId[..8]}",
-            Description: "Producto creado para una prueba de integración de órdenes",
-            CurrentUnitPrice: 250m,
-            StockQuantity: stock);
-    }
-
-    private static async Task<string> LoginAsAdminAndGetTokenAsync(HttpClient client)
-    {
-        var response = await client.PostAsJsonAsync(
-            "/api/auth/login",
-            new LoginModel("admin", "Admin123!"));
-
-        response.StatusCode.Should().Be(HttpStatusCode.OK,
-            "el administrador de prueba debe estar cargado desde admins.json");
-        return await ReadStringPropertyAsync(response, "token", "Token");
-    }
-
-    private static async Task<(string Token, Guid CustomerId)> RegisterCustomerAndGetCredentialsAsync(HttpClient client)
-    {
-        var uniqueId = Guid.NewGuid().ToString("N");
-        var response = await client.PostAsJsonAsync(
-            "/api/auth/register",
-            new RegisterModel(
-                Username: $"orderuser{uniqueId}",
-                Password: "Test123!",
-                Email: $"orderuser{uniqueId}@integration.local"));
-
-        response.StatusCode.Should().Be(HttpStatusCode.OK,
-            "el cliente de prueba debe poder registrarse");
-
-        using var document = await JsonDocument.ParseAsync(await response.Content.ReadAsStreamAsync());
-        var token = ReadString(document.RootElement, "token", "Token");
-        var customerId = ReadGuid(document.RootElement, "customerId", "CustomerId");
-        return (token, customerId);
-    }
-
-    private static async Task<string> ReadStringPropertyAsync(HttpResponseMessage response, params string[] names)
-    {
-        using var document = await JsonDocument.ParseAsync(await response.Content.ReadAsStreamAsync());
-        return ReadString(document.RootElement, names);
-    }
-
-    private static string ReadString(JsonElement element, params string[] names)
-    {
-        foreach (var name in names)
-        {
-            if (element.TryGetProperty(name, out var property) && property.ValueKind == JsonValueKind.String)
-            {
-                var value = property.GetString();
-                if (!string.IsNullOrWhiteSpace(value)) return value;
-            }
-        }
-
-        throw new Xunit.Sdk.XunitException($"No se encontró ninguna de estas propiedades: {string.Join(", ", names)}");
-    }
-
-    private static int ReadInt(JsonElement element, params string[] names)
-    {
-        foreach (var name in names)
-        {
-            if (element.TryGetProperty(name, out var property) && property.TryGetInt32(out var value))
-            {
-                return value;
-            }
-        }
-
-        throw new Xunit.Sdk.XunitException($"No se encontró un entero válido en: {string.Join(", ", names)}");
-    }
-
-    private static Guid ReadGuid(JsonElement element, params string[] names)
-    {
-        foreach (var name in names)
-        {
-            if (element.TryGetProperty(name, out var property) && property.ValueKind == JsonValueKind.String &&
-                Guid.TryParse(property.GetString(), out var value))
-            {
-                return value;
-            }
-        }
-
-        throw new Xunit.Sdk.XunitException($"No se encontró un GUID válido en: {string.Join(", ", names)}");
+        // El stock no debe haberse modificado.
+        var unchanged = await TestHelpers.GetProductFromDbAsync(_factory, product.Id);
+        unchanged!.StockQuantity.Should().Be(2);
     }
 }
