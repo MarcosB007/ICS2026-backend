@@ -1,4 +1,4 @@
-name: Build and Deploy to Azure App Service (Publish Profile)
+name: Build, Test and Deploy to Azure App Service (Publish Profile)
 
 on:
   push:
@@ -12,8 +12,51 @@ env:
   IMAGE_NAME: ics-backend
 
 jobs:
-  build-and-deploy:
+  # ==================================================================
+  # JOB 1: Quality Gate - Pruebas unitarias e de integracion
+  # ==================================================================
+  run-tests:
+    name: Quality Gate - Pruebas Unitarias e Integracion
     runs-on: ubuntu-latest
+    steps:
+      - name: 1. Obtener el código
+        uses: actions/checkout@v4
+
+      - name: 2. Configurar SDK de .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: 3. Restaurar dependencias
+        run: dotnet restore Dsw2025Tpi.sln
+
+      - name: 4. Compilar la solución
+        run: dotnet build Dsw2025Tpi.sln --no-restore --configuration Release
+
+      - name: 5. Ejecutar suite de pruebas (unitarias + integración)
+        run: >
+          dotnet test Dsw2025Tpi.sln
+          --no-build
+          --configuration Release
+          --verbosity normal
+          --logger "trx;LogFileName=resultados.trx"
+          --results-directory TestResults
+
+      - name: 6. Publicar resultados de las pruebas
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: resultados-pruebas
+          path: TestResults
+
+  # ==================================================================
+  # JOB 2: Construcción Docker y despliegue a Azure
+  # Solo se ejecuta si 'run-tests' termina con éxito
+  # ==================================================================
+  build-and-deploy:
+    name: Build Docker y Deploy a Azure
+    runs-on: ubuntu-latest
+    needs: run-tests
     steps:
       - name: 1. Obtener el código
         uses: actions/checkout@v4
