@@ -141,7 +141,7 @@ public class OrdersManagementService
             orderItem.Product = product; // Asignamos para tener el nombre en la respuesta inmediata
 
             orderItems.Add(orderItem);
-            total += orderItem.Subtotal;
+            total = orderItem.Subtotal;
         }
 
         var order = new Order(request.CustomerId, request.ShippingAddress, request.BillingAddress, request.Notes)

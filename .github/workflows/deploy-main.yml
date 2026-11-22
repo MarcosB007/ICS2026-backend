@@ -2,7 +2,7 @@ name: Build, Test and Deploy to Azure App Service (Publish Profile)
 
 on:
   push:
-    branches: [development, main]
+    branches: [development, main, test/US-24-evidencia-deploy-bloqueado]
   pull_request:
     branches: [development, main]
   workflow_dispatch:
